@@ -101,6 +101,7 @@ def efficient_fractal_loss(model, batch, device, curriculum, use_amp=True):
     - Horizon weights: harmonic decay (1, 1/2, 1/4, 1/10) not exponential
     - Fractal loss: always computed on all scales
     - Closure loss: added for learned harmonic basis
+    - FIX: Ensure total_loss remains a torch.Tensor.
     """
     seq_len, horizon, fractal_scales = curriculum.get_current_params()
     
@@ -141,7 +142,9 @@ def efficient_fractal_loss(model, batch, device, curriculum, use_amp=True):
         h_last = hidden[:, -1]
         horizon_logits, horizon_confidence = model.harmonic_horizon_predictor(h_last)
         
-        loss_horizon = 0
+        # Initialize loss_horizon as a Tensor
+        loss_horizon = torch.tensor(0.0, device=device) 
+        
         # FIXED: Harmonic decay based on lattice distances
         # Paper: "1, 1/2, 1/4, 1/10" for positions matching lattice structure
         # Approximate with: 1.0, 0.5, 0.5, 0.25, 0.25, 0.1, 0.1, 0.1, ...
@@ -163,7 +166,8 @@ def efficient_fractal_loss(model, batch, device, curriculum, use_amp=True):
                 loss_horizon += weights_harmonic[k] * loss_k
         
         # 4. Multi-scale fractal loss (ALWAYS computed)
-        loss_fractal = 0
+        # Initialize loss_fractal as a Tensor
+        loss_fractal = torch.tensor(0.0, device=device) 
         dataset_scales = [1, 2, 4]
         
         for scale in dataset_scales[1:]:  # Skip 1x
@@ -186,23 +190,25 @@ def efficient_fractal_loss(model, batch, device, curriculum, use_amp=True):
                     loss_fractal += (1.0 / scale) * loss_scale
         
         # 5. Closure loss for learned harmonic basis (Section 3.3)
-        loss_closure = model.get_closure_loss() if hasattr(model, 'get_closure_loss') else 0
+        # FIX: Ensure loss_closure is a Tensor (even if zero) to maintain gradient flow
+        loss_closure = model.get_closure_loss() if hasattr(model, 'get_closure_loss') else torch.tensor(0.0, device=device)
         
-        # FIXED: Paper-compliant total loss weighting
+        # FIXED: Paper-compliant total loss weighting - Now simplified as all components are Tensors
         total_loss = (
             1.0 * loss_lm +           # Primary task
             0.5 * loss_spine +         # Spine emphasis
-            4 * loss_horizon +       # Horizon (reduced from 0.8)
+            4 * loss_horizon +       # Horizon
             0.4 * loss_fractal +       # Multi-scale
-            0.1 * loss_closure if isinstance(loss_closure, torch.Tensor) else 0  # Basis closure
+            0.1 * loss_closure         # Basis closure
         )
     
     return total_loss, {
         'loss_lm': loss_lm.item(),
         'loss_spine': loss_spine.item(),
-        'loss_horizon': loss_horizon.item() if isinstance(loss_horizon, torch.Tensor) else loss_horizon,
-        'loss_fractal': loss_fractal.item() if isinstance(loss_fractal, torch.Tensor) else loss_fractal,
-        'loss_closure': loss_closure.item() if isinstance(loss_closure, torch.Tensor) else 0
+        # Use .item() safely now that they are guaranteed to be Tensors (or 0.0)
+        'loss_horizon': loss_horizon.item(), 
+        'loss_fractal': loss_fractal.item(), 
+        'loss_closure': loss_closure.item()
     }
 
 
@@ -356,6 +362,7 @@ def main():
     print("✓ Adaptive bottom transformer (DYNAMIC DEPTH ENABLED)")
     print("✓ Hierarchical injection gates")
     print("✓ Prediction lattice core")
+    print("✓ RESOLVED: 'float' object has no attribute 'backward' error.")
     print("=" * 70)
     print()
     
