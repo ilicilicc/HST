@@ -215,7 +215,7 @@ class FullLatticeFieldAnalyzer(nn.Module):
                 
                 count = 0
                 
-                # U nivou max_depth (npr. level 5), nema "dece" na nivou 6.
+                # U nivu max_depth (npr. level 5), nema "dece" na nivou 6.
                 if level == max_depth:
                     path_counts[node] = 1 # Inicijalni put za najdaljeg pretka
                     continue
