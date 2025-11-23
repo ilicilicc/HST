@@ -3,6 +3,7 @@ HST-v3 ULTRA - Complete Paper-Compliant Implementation - FINALIZED VERSION
 - KV Cache Implemented for 5-8x Speedup.
 - Lattice Core UPGRADED to CompleteLatticeCore (Full Path-Weighted GNN Logic).
 - Fixed KeyError: 'max_depth' in FullLatticeFieldAnalyzer.
+- FIX: Resolved 'RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation'
 """
 import torch
 import torch.nn as nn
@@ -313,7 +314,8 @@ class MultiLevelLatticeProcessor(nn.Module):
                 x[:, pos, :]
             ], dim=-1)
             
-            h_out[:, pos, :] = self.fusion(combined)
+            # FIXED: Avoid in-place assignment to slice to prevent RuntimeError
+            h_out[:, pos, :].copy_(self.fusion(combined))
             
         return h_out
 
@@ -372,9 +374,9 @@ class PathWeightedLatticeCore(nn.Module):
                     
                 path_count = structure['path_counts'].get(ancestor_pos, 1)
                 
-                path_weight = self.path_weight_net(
-                    torch.tensor([[float(path_count)]], device=x.device)
-                ).item()
+                # Ensure path_count is a float tensor for consistent device/autograd
+                path_count_tensor = torch.tensor([[float(path_count)]], device=x.device)
+                path_weight = self.path_weight_net(path_count_tensor).item()
                 
                 h_anc = x[:, ancestor_pos, :]
                 h_curr = h_out[:, pos, :]
@@ -393,7 +395,10 @@ class PathWeightedLatticeCore(nn.Module):
             aggregated = aggregated[:, -1, :]
             
             gate = self.update_gate(torch.cat([aggregated, h_out[:, pos, :]], dim=-1))
-            h_out[:, pos, :] = gate * aggregated + (1 - gate) * h_out[:, pos, :]
+            
+            # FIXED: Avoid in-place assignment to slice to prevent RuntimeError
+            updated_value = gate * aggregated + (1 - gate) * h_out[:, pos, :]
+            h_out[:, pos, :].copy_(updated_value)
             
         return h_out
 
