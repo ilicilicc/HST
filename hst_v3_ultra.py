@@ -3,7 +3,6 @@ HST-v3 ULTRA - Complete Paper-Compliant Implementation - FINALIZED VERSION
 - KV Cache Implemented for 5-8x Speedup.
 - Lattice Core UPGRADED to CompleteLatticeCore (Full Path-Weighted GNN Logic).
 - Fixed KeyError: 'max_depth' in FullLatticeFieldAnalyzer.
-- FIX: Resolved 'RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation'
 """
 import torch
 import torch.nn as nn
@@ -13,6 +12,24 @@ from typing import Dict, Tuple, Optional, List
 
 # Type definition for KV Cache: List[Tuple[torch.Tensor, torch.Tensor]]
 KVCache = Optional[List[Tuple[torch.Tensor, torch.Tensor]]]
+
+
+# ==========================================================
+# CACHE UTILITY (FIXED: Memory Leak Prevention)
+# ==========================================================
+def prune_cache(cache: KVCache, max_size: int = 2048) -> KVCache:
+    """Keep only the most recent tokens in cache to prevent memory overflow."""
+    if not cache or cache[0][0].size(2) <= max_size:
+        return cache
+    
+    pruned_cache = []
+    for k, v in cache:
+        # Keep only last max_size tokens
+        pruned_k = k[:, :, -max_size:, :]
+        pruned_v = v[:, :, -max_size:, :]
+        pruned_cache.append((pruned_k, pruned_v))
+    
+    return pruned_cache
 
 
 # ==========================================================
@@ -46,6 +63,20 @@ class SelfAttentionWithCache(nn.Module):
         present = (k, v)
         
         attn_weights = torch.matmul(q, k.transpose(2, 3)) / (self.head_dim ** 0.5)
+        
+        # Apply causal mask (FIXED: Ensure correct application for incremental/full passes)
+        full_S = k.size(2)
+        if full_S > S:
+            # Incremental step: only mask the new tokens' attention to future new tokens
+            attn_mask = torch.triu(torch.ones(S, S, dtype=torch.bool, device=x.device), diagonal=1)
+            attn_mask_full = torch.ones(S, full_S, dtype=torch.bool, device=x.device)
+            attn_mask_full[:, full_S - S:] = attn_mask
+            attn_weights.masked_fill_(attn_mask_full[None, None, :, :], -torch.inf)
+        else:
+            # Full sequence pass: standard causal mask
+            attn_mask = torch.triu(torch.ones(S, S, dtype=torch.bool, device=x.device), diagonal=1)
+            attn_weights.masked_fill_(attn_mask[None, None, :, :], -torch.inf)
+
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_output = torch.matmul(attn_weights, v).transpose(1, 2).contiguous().view(B, S, D)
         
@@ -105,7 +136,8 @@ class AdaptiveBlock(nn.Module):
 # 1. COMPLETE MULTI-LEVEL LATTICE CORE (FIXED)
 # ==========================================================
 class FullLatticeFieldAnalyzer(nn.Module):
-    """Analyzes the complete lattice structure to extract ALL levels and connection patterns."""
+    """Analyzes the complete lattice structure to extract ALL levels and connection patterns.
+    (FIXED: Only computes for spine positions at init time)"""
     def __init__(self, max_seq_len=8192):
         super().__init__()
         # Generate spine
@@ -119,23 +151,30 @@ class FullLatticeFieldAnalyzer(nn.Module):
         self.register_buffer('spine', torch.tensor(spine, dtype=torch.long))
         self.max_depth = self._compute_max_depth()
         
-        # Precompute full lattice structure (CPU-side for efficiency)
-        self.lattice_structure = self._build_full_structure(max_seq_len)
+        # Only precompute for spine positions (sparse optimization)
+        self.lattice_structure = {}
+        for pos in spine:
+            if pos < max_seq_len:
+                self.lattice_structure[pos] = self._analyze_position(pos)
+        
+        # For non-spine positions, compute on-demand
+        self._non_spine_cache = {}
     
     def _compute_max_depth(self):
         """Maximum depth of the lattice tree"""
         return len(self.spine)
     
-    def _build_full_structure(self, max_seq_len):
-        """Builds complete multi-level connection structure."""
-        structure = {}
+    def get_structure(self, pos: int):
+        """Get precomputed or on-demand structure for a position."""
+        if pos in self.lattice_structure:
+            return self.lattice_structure[pos]
         
-        for pos in range(min(max_seq_len, self.spine[-1].item() + 1)):
-            if pos in self.spine.tolist():
-                structure[pos] = self._analyze_position(pos)
-            else:
-                structure[pos] = self._analyze_non_spine(pos)
-        
+        if pos in self._non_spine_cache:
+            return self._non_spine_cache[pos]
+            
+        # Compute on-demand for non-spine positions
+        structure = self._analyze_non_spine(pos)
+        self._non_spine_cache[pos] = structure
         return structure
     
     def _analyze_position(self, pos):
@@ -161,10 +200,10 @@ class FullLatticeFieldAnalyzer(nn.Module):
             if current_level:
                 levels[level] = current_level.copy()
 
-        # max_depth je najveći ključ u levels
+        # max_depth is the largest key in levels
         max_depth = max(levels.keys()) if levels else 0
         
-        # Compute path counts - PROSLEĐUJEMO max_depth EKSPLICITNO
+        # Compute path counts - Pass max_depth explicitly
         path_counts = self._compute_path_counts(pos, levels, max_depth)
         
         return {
@@ -203,34 +242,33 @@ class FullLatticeFieldAnalyzer(nn.Module):
             'max_depth': 1
         }
     
-    # ISPRAVLJENA METODA (Dodat max_depth argument i izmenjen uslov)
     def _compute_path_counts(self, pos, levels, max_depth):
         """Dynamic programming to count paths to each ancestor."""
         path_counts = {pos: 1}
         
-        # Iterate levels backwards (od najdaljih predaka ka pos)
+        # Iterate levels backwards (from farthest ancestors to pos)
         for level in sorted(levels.keys(), reverse=True):
             for node in levels[level]:
                 if node == pos: continue
                 
                 count = 0
                 
-                # U nivu max_depth (npr. level 5), nema "dece" na nivou 6.
+                # At level max_depth (e.g., level 5), there are no "children" at level 6.
                 if level == max_depth:
-                    path_counts[node] = 1 # Inicijalni put za najdaljeg pretka
+                    path_counts[node] = 1 # Initial path for the farthest ancestor
                     continue
                 
-                # Traži "decu" na sledećem, bližem nivou (level + 1)
+                # Search for "children" at the next, closer level (level + 1)
                 for child in levels.get(level + 1, []):
-                    # Ako je 'node' predak od 'child' (po rekurentnoj formuli)
+                    # If 'node' is an ancestor of 'child' (by the recurrence formula)
                     if node in self._get_immediate_ancestors(child):
-                        # Dodaj broj puteva koji vode do 'child'
+                        # Add the number of paths leading to 'child'
                         count += path_counts.get(child, 0)
                 
                 if level != 0:
                     path_counts[node] = count
                 
-        # Ukloni pos iz path_counts
+        # Remove pos from path_counts
         path_counts.pop(pos, None)
         return path_counts
 
@@ -239,7 +277,7 @@ class MultiLevelLatticeProcessor(nn.Module):
     def __init__(self, d_model, max_seq_len):
         super().__init__()
         self.d_model = d_model
-        # Analyzer se poziva pri inicijalizaciji
+        # Analyzer is called upon initialization
         self.analyzer = FullLatticeFieldAnalyzer(max_seq_len)
         
         self.level_transforms = nn.ModuleList([
@@ -273,7 +311,7 @@ class MultiLevelLatticeProcessor(nn.Module):
             if spine_pos.item() < 3: continue
             
             pos = spine_pos.item()
-            structure = self.analyzer.lattice_structure.get(pos)
+            structure = self.analyzer.get_structure(pos)
             
             if structure is None: continue
             
@@ -314,13 +352,13 @@ class MultiLevelLatticeProcessor(nn.Module):
                 x[:, pos, :]
             ], dim=-1)
             
-            # FIXED: Avoid in-place assignment to slice to prevent RuntimeError
-            h_out[:, pos, :].copy_(self.fusion(combined))
+            h_out[:, pos, :] = self.fusion(combined)
             
         return h_out
 
 class PathWeightedLatticeCore(nn.Module):
-    """Uses path counts to weight ALL ancestor contributions and aggregates with GRU."""
+    """Uses path counts to weight ALL ancestor contributions and aggregates with GRU.
+    (FIXED: Batch-processes path weight network calls)"""
     def __init__(self, d_model, max_seq_len):
         super().__init__()
         self.d_model = d_model
@@ -357,47 +395,50 @@ class PathWeightedLatticeCore(nn.Module):
             if spine_pos.item() < 3: continue
             
             pos = spine_pos.item()
-            structure = self.analyzer.lattice_structure.get(pos)
+            structure = self.analyzer.get_structure(pos)
             
             if structure is None or structure['total_ancestors'] == 0: continue
             
-            messages = []
-            weights = []
+            all_ancestors = []
+            path_counts = []
             
-            ancestors = []
             for level in structure['levels']:
                 if level > 0:
-                    ancestors.extend(structure['levels'][level])
+                    for anc in structure['levels'][level]:
+                        if anc < S: 
+                            all_ancestors.append(anc)
+                            path_counts.append(structure['path_counts'].get(anc, 1))
+
+            if not all_ancestors: continue
+
+            # 1. Batch inference for path weights (PERFORMANCE FIX)
+            path_count_tensor = torch.tensor(path_counts, device=x.device).view(-1, 1).float()
+            path_weights_tensor = self.path_weight_net(path_count_tensor).squeeze() 
+
+            messages = []
             
-            for ancestor_pos in ancestors:
-                if ancestor_pos >= S: continue
-                    
-                path_count = structure['path_counts'].get(ancestor_pos, 1)
-                
-                path_count_tensor = torch.tensor([[float(path_count)]], device=x.device)
-                path_weight = self.path_weight_net(path_count_tensor).item()
-                
+            # 2. Collect messages
+            for ancestor_pos in all_ancestors:
                 h_anc = x[:, ancestor_pos, :]
                 h_curr = h_out[:, pos, :]
                 msg = self.message_fn(torch.cat([h_anc, h_curr], dim=-1))
-                
                 messages.append(msg)
-                weights.append(path_weight)
             
-            if not messages: continue
-            
+            # 3. Apply weights and aggregate
             msg_stack = torch.stack(messages, dim=1)
-            weights_tensor = torch.tensor(weights, device=x.device).view(1, -1, 1).expand(B, -1, D)
+            # Handle case where path_weights_tensor is a scalar
+            if path_weights_tensor.dim() == 0:
+                weights_tensor = path_weights_tensor.view(1, 1, 1).expand(B, -1, D)
+            else:
+                weights_tensor = path_weights_tensor.view(1, -1, 1).expand(B, -1, D)
+                
             weighted_msgs = msg_stack * weights_tensor
             
             aggregated, _ = self.aggregate_fn(weighted_msgs)
             aggregated = aggregated[:, -1, :]
             
             gate = self.update_gate(torch.cat([aggregated, h_out[:, pos, :]], dim=-1))
-            
-            # FIXED: Avoid in-place assignment to slice to prevent RuntimeError
-            updated_value = gate * aggregated + (1 - gate) * h_out[:, pos, :]
-            h_out[:, pos, :].copy_(updated_value)
+            h_out[:, pos, :] = gate * aggregated + (1 - gate) * h_out[:, pos, :]
             
         return h_out
 
@@ -464,7 +505,8 @@ class HSTv3Ultra(nn.Module):
         n_heads,
         n_layers,
         max_seq_len=8192,
-        horizon=16
+        horizon=16,
+        early_exit_confidence_threshold=0.93 # FIX: Magic number integrated
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -473,6 +515,7 @@ class HSTv3Ultra(nn.Module):
         self.max_seq_len = max_seq_len
         self.n_bottom_layers = n_layers // 2
         self.n_top_layers = n_layers - self.n_bottom_layers
+        self.early_exit_confidence_threshold = early_exit_confidence_threshold
         
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
@@ -482,7 +525,7 @@ class HSTv3Ultra(nn.Module):
             for _ in range(self.n_bottom_layers)
         ])
 
-        # Ažurirani Lattice Core
+        # Updated Lattice Core
         self.lattice_core = CompleteLatticeCore(d_model, max_seq_len)
         
         self.top_stack = nn.ModuleList([
@@ -515,7 +558,8 @@ class HSTv3Ultra(nn.Module):
             new_cache.append(present)
             cache_idx += 1
             
-            if past_len == 0 and i >= 1 and conf.item() > 0.93:
+            # FIX: Use integrated config value
+            if past_len == 0 and i >= 1 and conf.item() > self.early_exit_confidence_threshold:
                 predicted_depth = i + 1
                 break
         
@@ -550,7 +594,7 @@ class HSTv3Ultra(nn.Module):
         }
 
     @torch.no_grad()
-    def generate_ultra_fast(self, input_ids, max_new_tokens, temperature=1.0, top_k=50):
+    def generate_ultra_fast(self, input_ids, max_new_tokens, temperature=1.0, top_k=50, max_cache_size=2048):
         device = input_ids.device
         
         current_ids = input_ids.clone()
@@ -603,8 +647,10 @@ class HSTv3Ultra(nn.Module):
             # Verification Pass (Incremental)
             verification_output = self.forward(draft_tokens_tensor, cache=cache) 
             verification_logits = verification_output['logits'][0]
-            cache = verification_output['cache']
-            full_output['hidden_states'] = verification_output['hidden_states'] # Ažuriramo stanje za sledeći Draft
+            
+            # FIX: Prune cache to prevent memory leak
+            cache = prune_cache(verification_output['cache'], max_size=max_cache_size)
+            full_output['hidden_states'] = verification_output['hidden_states'] 
 
             num_drafted = H_drafted
             num_accepted = 0
@@ -658,7 +704,7 @@ class HSTv3Ultra(nn.Module):
 
 if __name__ == '__main__':
     print("=" * 70)
-    print("HST-v3 ULTRA (Konačna, Popravljena Implementacija SA KV CACHE i Lattice Core-om)")
+    print("HST-v3 ULTRA (Final, Repaired Implementation with KV CACHE and Lattice Core)")
     print("=" * 70)
     
     # Test model configuration: 8 layers (4 bottom/adaptive, 4 top/fixed)
@@ -674,7 +720,7 @@ if __name__ == '__main__':
     x = torch.randint(0, 50257, (2, 512)) 
     output = model(x)
     
-    # NAPOMENA: L_closure loss je uklonjen. Samo LM loss.
+    # NOTE: L_closure loss is typically zero in this test. Only LM loss here.
     loss = output['logits'].mean() 
     
     try:
