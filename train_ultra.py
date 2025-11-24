@@ -12,6 +12,7 @@ import os
 import time
 from tqdm import tqdm
 import torch.nn.functional as F
+import sys # NEW: for clean exit
 
 # Import the FIXED HST model
 from hst_v3_ultra import HSTv3Ultra
@@ -20,6 +21,18 @@ try:
     from tokenizer_utils import load_tokenizer
 except ImportError:
     def load_tokenizer(path): return None
+
+# NEW: Data verification function
+def verify_data_files(train_path: str, val_path: str):
+    """Checks for the existence of required data files."""
+    if not os.path.exists(train_path):
+        print(f"❌ Training data not found: {train_path}")
+        print("Please download and place the data files at the specified path.")
+        sys.exit(1)
+    if not os.path.exists(val_path):
+        print(f"❌ Validation data not found: {val_path}")
+        print("Please download and place the data files at the specified path.")
+        sys.exit(1)
 
 
 class FractalScaleDataset(Dataset):
@@ -197,7 +210,7 @@ def efficient_fractal_loss(model, batch, device, curriculum, use_amp=True):
         total_loss = (
             1.0 * loss_lm +           # Primary task
             0.5 * loss_spine +         # Spine emphasis
-            4 * loss_horizon +       # Horizon
+            0.7 * loss_horizon +       # Horizon
             0.4 * loss_fractal +       # Multi-scale
             0.1 * loss_closure         # Basis closure
         )
@@ -210,6 +223,26 @@ def efficient_fractal_loss(model, batch, device, curriculum, use_amp=True):
         'loss_fractal': loss_fractal.item(), 
         'loss_closure': loss_closure.item()
     }
+
+# NEW: Validation function
+@torch.no_grad()
+def validate(model, val_loader, device, curriculum, use_amp: bool):
+    """Runs a single validation epoch."""
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    
+    # Limit validation to 100 batches for speed
+    for batch in tqdm(val_loader, desc="Validating", total=100):
+        if num_batches >= 100:
+            break
+        
+        loss, _ = efficient_fractal_loss(model, batch, device, curriculum, use_amp=use_amp)
+        total_loss += loss.item()
+        num_batches += 1
+    
+    model.train()
+    return total_loss / num_batches if num_batches > 0 else 0.0
 
 
 def benchmark_speed(model, tokenizer_path='tokenizer.json'):
@@ -280,17 +313,23 @@ def main():
     print(f"Starting curriculum: seq_len={seq_len}, horizon={horizon}, scales={fractal_scales}")
     print()
     
+    # Define paths
+    train_data_path = 'data/wiki/train.bin'
+    val_data_path = 'data/wiki/val.bin'
+
+    # NEW: Verify data files before proceeding
+    verify_data_files(train_data_path, val_data_path)
+
     # Load datasets
     print("Loading fractal-scale datasets...")
-    # NOTE: These file paths need to exist: 'data/wiki/train.bin' and 'data/wiki/val.bin'
     train_dataset = FractalScaleDataset(
-        'data/wiki/train.bin',
+        train_data_path,
         config['max_seq_len'],
         fractal_scales=[1, 2, 4],
         horizon=config['horizon']
     )
     val_dataset = FractalScaleDataset(
-        'data/wiki/val.bin',
+        val_data_path,
         config['max_seq_len'],
         fractal_scales=[1, 2, 4],
         horizon=config['horizon']
@@ -356,30 +395,38 @@ def main():
     
     print("=" * 70)
     print("FIXES APPLIED:")
+    print("✓ Validation Loop Added for Robust Training") # NEW fix log
+    print("✓ Data Path Verification Added")              # NEW fix log
     print("✓ Horizon loss: Harmonic decay (1, 1/2, 1/4, 1/10...)")
     print("✓ Fractal loss: Always computed on all scales")
     print("✓ Closure loss: Added for learned harmonic basis")
     print("✓ Adaptive bottom transformer (DYNAMIC DEPTH ENABLED)")
     print("✓ Hierarchical injection gates")
     print("✓ Prediction lattice core")
-    print("✓ RESOLVED: 'float' object has no attribute 'backward' error.")
+    print("✓ RESOLVED: Inplace operation RuntimeError (via .copy_())")
     print("=" * 70)
     print()
     
     model.train()
     step = 0
-    best_val_loss = float('inf')
+    best_val_loss = float('inf') # Initialized to track validation loss
     best_speed = 0
     accumulation_counter = 0
     
     try:
         # Load checkpoint if available
         checkpoint_files = sorted([f for f in os.listdir('checkpoints/ultra_efficient') if f.endswith('.pt')])
-        if checkpoint_files:
-            latest_checkpoint = checkpoint_files[-1]
-            checkpoint_path = os.path.join('checkpoints/ultra_efficient', latest_checkpoint)
+        
+        # Priority load: Check for best_val_checkpoint first
+        load_path = None
+        if os.path.exists('checkpoints/ultra_efficient/best_val_checkpoint.pt'):
+            load_path = 'checkpoints/ultra_efficient/best_val_checkpoint.pt'
+        elif checkpoint_files:
+            load_path = os.path.join('checkpoints/ultra_efficient', checkpoint_files[-1])
             
-            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        if load_path:
+            print(f"Loading checkpoint from: {load_path}")
+            checkpoint = torch.load(load_path, map_location=device, weights_only=False)
             
             # Handle state dict
             state_dict = checkpoint['model_state_dict']
@@ -393,11 +440,12 @@ def main():
             
             step = checkpoint.get('step', 0)
             best_speed = checkpoint.get('best_speed', 0)
+            best_val_loss = checkpoint.get('best_val_loss', float('inf')) # Load best val loss
             
             if 'curriculum_stage' in checkpoint:
                 curriculum.current_stage = checkpoint['curriculum_stage']
             
-            print(f"✓ Resuming from step {step}")
+            print(f"✓ Resuming from step {step} (Best Val Loss: {best_val_loss:.4f})")
             print("-" * 70)
 
         while step < config['max_steps']:
@@ -443,7 +491,7 @@ def main():
                         print(f"\n🎓 Stage {curriculum.current_stage}: seq_len={seq_len}")
                     
                     # Log
-                    if step % config['log_interval'] == 0:
+                    if step % config['log_interval'] == 0 and step > 0:
                         lr = scheduler.get_last_lr()[0]
                         total_display = (loss_dict['loss_lm'] + 
                                        0.5 * loss_dict['loss_spine'] + 
@@ -451,25 +499,36 @@ def main():
                                        0.4 * loss_dict['loss_fractal'] +
                                        0.1 * loss_dict.get('loss_closure', 0))
                         
-                        # Fetch and display the dynamic depth for context
-                        try:
-                            # Note: This attempts to fetch the depth from the last forward pass
-                            # Since the loss computation calls forward(), we can typically access the last value.
-                            # In a rigorous production system, this should be returned from loss function.
-                            # For simplicity here, we assume the loss fn provides the output dict.
-                            # We'll rely on the model test printout for verification for now.
-                            depth_info = ""
-                        except:
-                            depth_info = ""
-
                         print(f"Step {step:5d} | Total: {total_display:.4f} | "
                               f"LM: {loss_dict['loss_lm']:.4f} | "
                               f"Spine: {loss_dict['loss_spine']:.4f} | "
                               f"Horizon: {loss_dict['loss_horizon']:.4f} | "
                               f"Fractal: {loss_dict['loss_fractal']:.4f} | "
                               f"Closure: {loss_dict.get('loss_closure', 0):.4f} | "
-                              f"LR: {lr:.6f} {depth_info}")
+                              f"LR: {lr:.6f}")
                     
+                    # NEW: Validation check and checkpoint saving
+                    if step % config['eval_interval'] == 0 and step > 0:
+                        val_loss = validate(model, val_loader, device, curriculum, use_amp=use_amp)
+                        print(f"\n📊 Validation Loss: {val_loss:.4f} (Best: {best_val_loss:.4f})")
+                        
+                        if val_loss < best_val_loss:
+                            best_val_loss = val_loss
+                            model_to_save = model._orig_mod if hasattr(model, '_orig_mod') else model
+                            
+                            # Save best model based on validation loss
+                            torch.save({
+                                'model_state_dict': model_to_save.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'scheduler_state_dict': scheduler.state_dict(),
+                                'step': step,
+                                'config': config,
+                                'best_speed': best_speed,
+                                'best_val_loss': best_val_loss,
+                                'curriculum_stage': curriculum.current_stage
+                            }, f'checkpoints/ultra_efficient/best_val_checkpoint.pt')
+                            print(f"   ⭐ New best validation loss. Saved 'best_val_checkpoint.pt'")
+
                     # Benchmark
                     if step % config['benchmark_interval'] == 0 and step > 0:
                         print("\n🚀 Speed Benchmark...")
@@ -486,7 +545,7 @@ def main():
                         print("-" * 70)
                         model.train()
                     
-                    # Save
+                    # Save regular checkpoint
                     if step % config['save_interval'] == 0 and step > 0:
                         model_to_save = model._orig_mod if hasattr(model, '_orig_mod') else model
                         
@@ -497,6 +556,7 @@ def main():
                             'step': step,
                             'config': config,
                             'best_speed': best_speed,
+                            'best_val_loss': best_val_loss,
                             'curriculum_stage': curriculum.current_stage
                         }, f'checkpoints/ultra_efficient/checkpoint_{step}.pt')
                         print(f"✓ Saved checkpoint at step {step}")

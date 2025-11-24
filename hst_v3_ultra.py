@@ -374,7 +374,6 @@ class PathWeightedLatticeCore(nn.Module):
                     
                 path_count = structure['path_counts'].get(ancestor_pos, 1)
                 
-                # Ensure path_count is a float tensor for consistent device/autograd
                 path_count_tensor = torch.tensor([[float(path_count)]], device=x.device)
                 path_weight = self.path_weight_net(path_count_tensor).item()
                 
