@@ -1,3 +1,107 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Dict, Tuple, Optional, List
+
+# Type definition for KV Cache: List[Tuple[torch.Tensor, torch.Tensor]]
+KVCache = Optional[List[Tuple[torch.Tensor, torch.Tensor]]]
+
+
+class ChunkEncoder(nn.Module):
+    """Encodes a chunk of tokens into a single vector representation."""
+    def __init__(self, d_model, chunk_size=128):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.d_model = d_model
+
+        # Local transformer for within-chunk processing
+        self.local_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model, nhead=8, dim_feedforward=d_model*4, batch_first=True),
+            num_layers=2
+        )
+
+        # Compress chunk to single representation
+        self.chunk_pooling = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model)
+        )
+
+    def forward(self, token_embeddings):
+        """
+        Args:
+            token_embeddings: [batch, num_chunks * chunk_size, d_model]
+        Returns:
+            chunk_embeddings: [batch, num_chunks, d_model]
+        """
+        B, total_tokens, D = token_embeddings.shape
+        num_chunks = total_tokens // self.chunk_size
+
+        # Reshape into chunks
+        chunks = token_embeddings[:, :num_chunks * self.chunk_size, :]
+        chunks = chunks.view(B * num_chunks, self.chunk_size, D)
+
+        # Local attention within chunk
+        encoded = self.local_encoder(chunks)
+
+        # Pool to single vector (mean + learned compression)
+        pooled = encoded.mean(dim=1)  # [B * num_chunks, D]
+        compressed = self.chunk_pooling(pooled)
+
+        # Reshape back to [B, num_chunks, D]
+        chunk_embeddings = compressed.view(B, num_chunks, D)
+
+        return chunk_embeddings
+
+
+class ChunkDecoder(nn.Module):
+    """Decodes chunk representation back to token-level predictions."""
+    def __init__(self, d_model, vocab_size, chunk_size=128):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.d_model = d_model
+
+        # Expand chunk vector to chunk_size tokens
+        self.chunk_expander = nn.Linear(d_model, d_model * chunk_size)
+
+        # Local refinement transformer
+        self.local_decoder = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(d_model, nhead=8, dim_feedforward=d_model*4, batch_first=True),
+            num_layers=2
+        )
+
+        # Token prediction head
+        self.lm_head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, chunk_embeddings, chunk_idx=None):
+        """
+        Args:
+            chunk_embeddings: [batch, num_chunks, d_model]
+            chunk_idx: Optional specific chunk to decode
+        Returns:
+            token_logits: [batch, chunk_size, vocab_size] or [batch, num_chunks * chunk_size, vocab_size]
+        """
+        B, num_chunks, D = chunk_embeddings.shape
+
+        if chunk_idx is not None:
+            chunk = chunk_embeddings[:, chunk_idx:chunk_idx+1, :]
+            expanded = self.chunk_expander(chunk).view(B, 1, self.chunk_size, D)
+        else:
+            expanded = self.chunk_expander(chunk_embeddings).view(B, num_chunks, self.chunk_size, D)
+
+        num_chunks_to_process = 1 if chunk_idx is not None else num_chunks
+        expanded = expanded.view(B * num_chunks_to_process, self.chunk_size, D)
+
+        refined = self.local_decoder(expanded, expanded)
+
+        if chunk_idx is not None:
+            refined = refined.view(B, self.chunk_size, D)
+        else:
+            refined = refined.view(B, num_chunks * self.chunk_size, D)
+
+        logits = self.lm_head(refined)
+        return logits
+
 """
 HST-v3 ULTRA - Complete Paper-Compliant Implementation - FINALIZED VERSION
 - KV Cache Implemented for 5-8x Speedup.
@@ -305,8 +409,7 @@ class MultiLevelLatticeProcessor(nn.Module):
         spine = self.analyzer.spine
         relevant_spine = spine[spine < S]
         
-        h_out = x.clone()
-        
+        updates = {}
         for spine_pos in relevant_spine:
             if spine_pos.item() < 3: continue
             
@@ -318,11 +421,10 @@ class MultiLevelLatticeProcessor(nn.Module):
             level_features = []
             
             for level in range(structure['max_depth'] + 1):
-                if level == 0: continue # Skip the position itself
+                if level == 0: continue
                 if level not in structure['levels']: continue
                 
                 level_nodes = structure['levels'][level]
-                
                 level_h = []
                 total_weight = 0.0
                 
@@ -333,28 +435,34 @@ class MultiLevelLatticeProcessor(nn.Module):
                         total_weight += weight
                 
                 if level_h and total_weight > 0:
-                    # Weighted mean pooling within level
                     level_feat = torch.stack(level_h, dim=1).sum(dim=1) / total_weight
-                    
-                    # Transform with level-specific processor
                     level_feat = self.level_transforms[level](level_feat)
                     level_features.append(level_feat)
-            
+
             if not level_features: continue
-            
+
             level_stack = torch.stack(level_features, dim=1)
-            
-            query = h_out[:, pos:pos+1, :]
+            query = x[:, pos:pos+1, :]
             attended, _ = self.level_attention(query, level_stack, level_stack)
-            
-            combined = torch.cat([
-                attended.squeeze(1),
-                x[:, pos, :]
-            ], dim=-1)
-            
-            h_out[:, pos, :] = self.fusion(combined)
-            
-        return h_out
+            combined = torch.cat([attended.squeeze(1), x[:, pos, :]], dim=-1)
+            updates[pos] = self.fusion(combined)
+
+        if not updates:
+            return x
+
+        sorted_positions = sorted(updates.keys())
+        output_slices = []
+        last_pos = 0
+        for pos in sorted_positions:
+            if pos > last_pos:
+                output_slices.append(x[:, last_pos:pos, :])
+            output_slices.append(updates[pos].unsqueeze(1))
+            last_pos = pos + 1
+
+        if last_pos < S:
+            output_slices.append(x[:, last_pos:S, :])
+
+        return torch.cat(output_slices, dim=1)
 
 class PathWeightedLatticeCore(nn.Module):
     """Uses path counts to weight ALL ancestor contributions and aggregates with GRU.
@@ -389,8 +497,7 @@ class PathWeightedLatticeCore(nn.Module):
         spine = self.analyzer.spine
         relevant_spine = spine[spine < S]
         
-        h_out = x.clone()
-        
+        updates = {}
         for spine_pos in relevant_spine:
             if spine_pos.item() < 3: continue
             
@@ -405,28 +512,23 @@ class PathWeightedLatticeCore(nn.Module):
             for level in structure['levels']:
                 if level > 0:
                     for anc in structure['levels'][level]:
-                        if anc < S: 
+                        if anc < S:
                             all_ancestors.append(anc)
                             path_counts.append(structure['path_counts'].get(anc, 1))
 
             if not all_ancestors: continue
 
-            # 1. Batch inference for path weights (PERFORMANCE FIX)
             path_count_tensor = torch.tensor(path_counts, device=x.device).view(-1, 1).float()
-            path_weights_tensor = self.path_weight_net(path_count_tensor).squeeze() 
+            path_weights_tensor = self.path_weight_net(path_count_tensor).squeeze()
 
             messages = []
-            
-            # 2. Collect messages
             for ancestor_pos in all_ancestors:
                 h_anc = x[:, ancestor_pos, :]
-                h_curr = h_out[:, pos, :]
+                h_curr = x[:, pos, :]
                 msg = self.message_fn(torch.cat([h_anc, h_curr], dim=-1))
                 messages.append(msg)
             
-            # 3. Apply weights and aggregate
             msg_stack = torch.stack(messages, dim=1)
-            # Handle case where path_weights_tensor is a scalar
             if path_weights_tensor.dim() == 0:
                 weights_tensor = path_weights_tensor.view(1, 1, 1).expand(B, -1, D)
             else:
@@ -437,10 +539,25 @@ class PathWeightedLatticeCore(nn.Module):
             aggregated, _ = self.aggregate_fn(weighted_msgs)
             aggregated = aggregated[:, -1, :]
             
-            gate = self.update_gate(torch.cat([aggregated, h_out[:, pos, :]], dim=-1))
-            h_out[:, pos, :] = gate * aggregated + (1 - gate) * h_out[:, pos, :]
-            
-        return h_out
+            gate = self.update_gate(torch.cat([aggregated, x[:, pos, :]], dim=-1))
+            updates[pos] = gate * aggregated + (1 - gate) * x[:, pos, :]
+
+        if not updates:
+            return x
+
+        sorted_positions = sorted(updates.keys())
+        output_slices = []
+        last_pos = 0
+        for pos in sorted_positions:
+            if pos > last_pos:
+                output_slices.append(x[:, last_pos:pos, :])
+            output_slices.append(updates[pos].unsqueeze(1))
+            last_pos = pos + 1
+
+        if last_pos < S:
+            output_slices.append(x[:, last_pos:S, :])
+
+        return torch.cat(output_slices, dim=1)
 
 
 class CompleteLatticeCore(nn.Module):
@@ -495,9 +612,9 @@ class HarmonicHorizonPredictor(nn.Module):
         return logits_list, confidence
 
 # ==========================================================
-# 3. FULL HST-v3 ULTRA MODEL
+# 3. FULL HST-v4 UNIFIED MODEL
 # ==========================================================
-class HSTv3Ultra(nn.Module):
+class HSTv4Unified(nn.Module):
     def __init__(
         self,
         vocab_size,
@@ -506,7 +623,9 @@ class HSTv3Ultra(nn.Module):
         n_layers,
         max_seq_len=8192,
         horizon=16,
-        early_exit_confidence_threshold=0.93 # FIX: Magic number integrated
+        early_exit_confidence_threshold=0.93,
+        mode='token', # 'token' or 'chunk'
+        chunk_size=128
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -516,29 +635,41 @@ class HSTv3Ultra(nn.Module):
         self.n_bottom_layers = n_layers // 2
         self.n_top_layers = n_layers - self.n_bottom_layers
         self.early_exit_confidence_threshold = early_exit_confidence_threshold
-        
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_embedding = nn.Embedding(max_seq_len, d_model)
-        
-        self.adaptive_bottom = nn.ModuleList([
-            AdaptiveBlock(d_model=d_model, n_heads=n_heads) 
-            for _ in range(self.n_bottom_layers)
-        ])
+        self.mode = mode
+        self.chunk_size = chunk_size
 
-        # Updated Lattice Core
-        self.lattice_core = CompleteLatticeCore(d_model, max_seq_len)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
         
-        self.top_stack = nn.ModuleList([
-            TransformerEncoderLayerWithCache(d_model=d_model, n_heads=n_heads)
-            for _ in range(self.n_top_layers)
-        ])
+        if self.mode == 'chunk':
+            self.pos_embedding = nn.Embedding(max_seq_len * chunk_size, d_model)
+            self.chunk_encoder = ChunkEncoder(d_model, chunk_size)
+            self.chunk_decoder = ChunkDecoder(d_model, vocab_size, chunk_size)
+            self.lattice_core = CompleteLatticeCore(d_model, max_seq_len) # Operates on chunks
+        else:
+            self.pos_embedding = nn.Embedding(max_seq_len, d_model)
+            self.adaptive_bottom = nn.ModuleList([
+                AdaptiveBlock(d_model=d_model, n_heads=n_heads)
+                for _ in range(self.n_bottom_layers)
+            ])
+            self.lattice_core = CompleteLatticeCore(d_model, max_seq_len) # Operates on tokens
+            self.top_stack = nn.ModuleList([
+                TransformerEncoderLayerWithCache(d_model=d_model, n_heads=n_heads)
+                for _ in range(self.n_top_layers)
+            ])
 
         self.harmonic_horizon_predictor = HarmonicHorizonPredictor(d_model, vocab_size, horizon=horizon)
-        
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.ln_f = nn.LayerNorm(d_model)
-        
+
     def forward(self, input_ids: torch.Tensor, cache: KVCache = None) -> Dict:
+        if self.mode == 'token':
+            return self.forward_token(input_ids, cache)
+        elif self.mode == 'chunk':
+            return self.forward_chunk(input_ids)
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+    def forward_token(self, input_ids: torch.Tensor, cache: KVCache = None) -> Dict:
         B, seq_len = input_ids.shape
         device = input_ids.device
         
@@ -551,24 +682,19 @@ class HSTv3Ultra(nn.Module):
         cache_idx = 0
         predicted_depth = self.n_bottom_layers
 
-        # 1. Adaptive Bottom Stack (Early-Exit Logic)
         for i, block in enumerate(self.adaptive_bottom):
             layer_past = cache[cache_idx] if cache else None
             x, conf, present = block(x, layer_past)
             new_cache.append(present)
             cache_idx += 1
             
-            # FIX: Use integrated config value
             if past_len == 0 and i >= 1 and conf.item() > self.early_exit_confidence_threshold:
                 predicted_depth = i + 1
                 break
         
         h_bottom = x
-        
-        # 2. Multi-Layer Lattice Core Processing
         h_lattice_out = self.lattice_core(h_bottom)
         
-        # 3. Top Stack
         h_top_in = h_lattice_out
         for i, block in enumerate(self.top_stack):
             layer_past = cache[cache_idx] if cache else None
@@ -577,11 +703,7 @@ class HSTv3Ultra(nn.Module):
             cache_idx += 1
             
         h_final = h_top_in
-        
-        # 4. Next-Token Logits
         logits_t1 = self.lm_head(self.ln_f(h_final))
-        
-        # 5. Horizon Logits
         logits_horizon, confidence = self.harmonic_horizon_predictor(h_final)
         
         return {
@@ -593,8 +715,36 @@ class HSTv3Ultra(nn.Module):
             'cache': new_cache
         }
 
+    def forward_chunk(self, input_ids: torch.Tensor) -> Dict:
+        B, total_tokens = input_ids.shape
+        device = input_ids.device
+
+        positions = torch.arange(0, total_tokens, dtype=torch.long, device=device)
+        x = self.token_embedding(input_ids) + self.pos_embedding(positions)
+
+        chunk_emb = self.chunk_encoder(x)
+        h_lattice_out = self.lattice_core(chunk_emb)
+        logits = self.chunk_decoder(h_lattice_out, chunk_idx=None) # Pass None during training
+
+        # For compatibility, we can still return a horizon prediction
+        # based on the last chunk's representation
+        last_chunk_rep = h_lattice_out[:, -1:, :]
+        logits_horizon, confidence = self.harmonic_horizon_predictor(last_chunk_rep)
+
+        return {
+            'logits': logits,
+            'horizon_logits': logits_horizon,
+            'confidence': confidence,
+            'hidden_states': h_lattice_out, # Note: these are chunk-level states
+            'bottom_depth': 0, # Not applicable in chunk mode
+            'cache': None # Not applicable in chunk mode
+        }
+
     @torch.no_grad()
     def generate_ultra_fast(self, input_ids, max_new_tokens, temperature=1.0, top_k=50, max_cache_size=2048):
+        if self.mode == 'chunk':
+            raise NotImplementedError("Generation is not yet implemented for chunk mode.")
+
         device = input_ids.device
         
         current_ids = input_ids.clone()
@@ -704,39 +854,68 @@ class HSTv3Ultra(nn.Module):
 
 if __name__ == '__main__':
     print("=" * 70)
-    print("HST-v3 ULTRA (Final, Repaired Implementation with KV CACHE and Lattice Core)")
+    print("HST-v4 UNIFIED (Token and Chunk Mode)")
     print("=" * 70)
-    
-    # Test model configuration: 8 layers (4 bottom/adaptive, 4 top/fixed)
-    model = HSTv3Ultra(
+
+    # Test Token Mode
+    print("\n--- Testing Token Mode ---")
+    model_token = HSTv4Unified(
         vocab_size=50257,
         d_model=256,
         n_heads=4,
-        n_layers=8, 
-        horizon=16
+        n_layers=8,
+        horizon=16,
+        mode='token'
     )
-
-    # Test forward pass and autograd
-    x = torch.randint(0, 50257, (2, 512)) 
-    output = model(x)
-    
-    # NOTE: L_closure loss is typically zero in this test. Only LM loss here.
-    loss = output['logits'].mean() 
-    
+    x_token = torch.randint(0, 50257, (2, 512))
+    output_token = model_token(x_token)
+    loss_token = output_token['logits'].mean()
     try:
-        loss.backward()
-        print("✅ Forward/Backward pass successful!")
+        loss_token.backward()
+        print("✅ Token mode forward/backward pass successful!")
     except RuntimeError as e:
-        print(f"❌ Backward pass failed: {e}")
-        
-    
-    # Test ultra-fast generation
-    print("\nTesting Ultra-Fast Generation...")
+        print(f"❌ Token mode backward pass failed: {e}")
+
+    print("\n--- Testing Token Mode Generation ---")
     prompt = torch.randint(0, 50257, (1, 10))
-    generated, stats = model.generate_ultra_fast(prompt, max_new_tokens=50, temperature=0.8)
-    
+    generated, stats = model_token.generate_ultra_fast(prompt, max_new_tokens=50, temperature=0.8)
     print("✅ Generation successful!")
     print(f"   Generated length: {generated.size(1) - prompt.size(1)} tokens")
     print(f"   Acceptance Rate: {stats['acceptance_rate']:.3f}")
     print(f"   Effective Speedup: {stats['effective_speedup']:.2f}x")
+
+    # Test Chunk Mode
+    print("\n--- Testing Chunk Mode ---")
+    model_chunk = HSTv4Unified(
+        vocab_size=50257,
+        d_model=256,
+        n_heads=4,
+        n_layers=8,
+        horizon=16,
+        mode='chunk',
+        chunk_size=128
+    )
+    x_chunk = torch.randint(0, 50257, (2, 512)) # 4 chunks
+    output_chunk = model_chunk(x_chunk)
+    loss_chunk = output_chunk['logits'].mean()
+    try:
+        loss_chunk.backward()
+        print("✅ Chunk mode forward/backward pass successful!")
+    except RuntimeError as e:
+        print(f"❌ Chunk mode backward pass failed: {e}")
+
+    print("\n--- Testing Chunk Mode Generation (expecting error) ---")
+    try:
+        model_chunk.generate_ultra_fast(x_chunk, max_new_tokens=10)
+        print("❌ Test failed: Expected NotImplementedError")
+    except NotImplementedError:
+        print("✅ Test passed: Correctly raised NotImplementedError.")
+
+    print("\n--- Testing Single Chunk Decoding ---")
+    single_chunk_logits = model_chunk.chunk_decoder(output_chunk['hidden_states'], chunk_idx=0)
+    if single_chunk_logits.shape == (2, 128, 50257):
+        print("✅ Test passed: Single chunk decoding output shape is correct.")
+    else:
+        print(f"❌ Test failed: Incorrect output shape {single_chunk_logits.shape}")
+
     print("=" * 70)
