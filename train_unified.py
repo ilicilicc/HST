@@ -16,8 +16,8 @@ import sys
 import logging
 from typing import List, Dict
 
-# Import the FIXED HST model
-from hst_v3_ultra import HSTv3Ultra
+# Import the UNIFIED HST model
+from hst_v4_unified import HSTv4Unified
 
 try:
     from tokenizer_utils import load_tokenizer
@@ -377,15 +377,20 @@ def main():
     )
     
     # Create model
-    logger.info("Creating HST-v3 ULTRA model...")
-    model = HSTv3Ultra(
+    config['mode'] = 'token' # or 'chunk'
+    config['chunk_size'] = 128 if config['mode'] == 'chunk' else 0
+
+    logger.info(f"Creating HST-v4 UNIFIED model in {config['mode']} mode...")
+    model = HSTv4Unified(
         vocab_size=50257,
         d_model=config['d_model'],
         n_heads=config['n_heads'],
         n_layers=config['n_layers'],
         max_seq_len=config['max_seq_len'],
         horizon=config['horizon'],
-        early_exit_confidence_threshold=config['early_exit_confidence_threshold'] # FIXED
+        early_exit_confidence_threshold=config['early_exit_confidence_threshold'],
+        mode=config['mode'],
+        chunk_size=config['chunk_size']
     ).to(device)
     
     # Compile
@@ -464,39 +469,46 @@ def main():
         while step < config['max_steps']:
             for batch in train_loader:
                 
-                # Training step (omitted boilerplate for brevity)
-                if use_amp:
-                    total_loss, loss_dict = efficient_fractal_loss(
-                        model, batch, device, curriculum, use_amp=True
-                    )
+                # Training step
+                if config['mode'] == 'token':
+                    if use_amp:
+                        total_loss, loss_dict = efficient_fractal_loss(
+                            model, batch, device, curriculum, use_amp=True
+                        )
+                        scaler.scale(total_loss / config['gradient_accumulation_steps']).backward()
+                    else:
+                        total_loss, loss_dict = efficient_fractal_loss(
+                            model, batch, device, curriculum, use_amp=False
+                        )
+                        (total_loss / config['gradient_accumulation_steps']).backward()
+                else: # chunk mode
+                    input_ids = batch['input_ids'].to(device)
+                    labels = batch['labels'].to(device)
+                    with torch.amp.autocast('cuda', enabled=use_amp):
+                        output = model(input_ids)
+                        logits = output['logits']
+                        total_loss = F.cross_entropy(logits.view(-1, model.vocab_size), labels.view(-1))
                     
-                    scaler.scale(total_loss / config['gradient_accumulation_steps']).backward()
-                    
-                    accumulation_counter += 1
-                    if accumulation_counter >= config['gradient_accumulation_steps']:
+                    if use_amp:
+                        scaler.scale(total_loss / config['gradient_accumulation_steps']).backward()
+                    else:
+                        (total_loss / config['gradient_accumulation_steps']).backward()
+
+                accumulation_counter += 1
+                if accumulation_counter >= config['gradient_accumulation_steps']:
+                    if use_amp:
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         scaler.step(optimizer)
                         scaler.update()
-                        optimizer.zero_grad()
-                        scheduler.step()
-                        accumulation_counter = 0
-                        step += 1
-                else:
-                    total_loss, loss_dict = efficient_fractal_loss(
-                        model, batch, device, curriculum, use_amp=False
-                    )
-                    
-                    (total_loss / config['gradient_accumulation_steps']).backward()
-                    
-                    accumulation_counter += 1
-                    if accumulation_counter >= config['gradient_accumulation_steps']:
+                    else:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         optimizer.step()
-                        optimizer.zero_grad()
-                        scheduler.step()
-                        accumulation_counter = 0
-                        step += 1
+
+                    optimizer.zero_grad()
+                    scheduler.step()
+                    accumulation_counter = 0
+                    step += 1
                 
                 if accumulation_counter == 0:
                     # Curriculum progression
@@ -504,32 +516,49 @@ def main():
                         seq_len, horizon, fractal_scales = curriculum.get_current_params()
                         logger.info(f"🎓 Stage {curriculum.current_stage}: seq_len={seq_len}")
                     
-                    # Log (FIXED: Uses LossWeights for correct display and logger)
+                    # Log
                     if step % config['log_interval'] == 0:
                         lr = scheduler.get_last_lr()[0]
-                        total_display = (
-                            LossWeights.LM * loss_dict['loss_lm'] +
-                            LossWeights.SPINE * loss_dict['loss_spine'] +
-                            LossWeights.HORIZON * loss_dict['loss_horizon'] + # FIXED: Now uses 0.7
-                            LossWeights.FRACTAL * loss_dict['loss_fractal'] +
-                            LossWeights.CLOSURE * loss_dict.get('loss_closure', 0)
-                        )
-                        
-                        logger.info(f"Step {step:5d} | Total: {total_display:.4f} | "
-                              f"LM: {loss_dict['loss_lm']:.4f} | "
-                              f"Spine: {loss_dict['loss_spine']:.4f} | "
-                              f"Horizon: {loss_dict['loss_horizon']:.4f} | "
-                              f"Fractal: {loss_dict['loss_fractal']:.4f} | "
-                              f"Closure: {loss_dict.get('loss_closure', 0):.4f} | "
-                              f"LR: {lr:.6f}")
-                    
-                    # Validation and Benchmark (FIXED: Tied to eval_interval)
+                        if config['mode'] == 'token':
+                            total_display = (
+                                LossWeights.LM * loss_dict['loss_lm'] +
+                                LossWeights.SPINE * loss_dict['loss_spine'] +
+                                LossWeights.HORIZON * loss_dict['loss_horizon'] +
+                                LossWeights.FRACTAL * loss_dict['loss_fractal'] +
+                                LossWeights.CLOSURE * loss_dict.get('loss_closure', 0)
+                            )
+                            logger.info(f"Step {step:5d} | Total: {total_display:.4f} | "
+                                  f"LM: {loss_dict['loss_lm']:.4f} | "
+                                  f"Spine: {loss_dict['loss_spine']:.4f} | "
+                                  f"Horizon: {loss_dict['loss_horizon']:.4f} | "
+                                  f"Fractal: {loss_dict['loss_fractal']:.4f} | "
+                                  f"Closure: {loss_dict.get('loss_closure', 0):.4f} | "
+                                  f"LR: {lr:.6f}")
+                        else:
+                            logger.info(f"Step {step:5d} | Total Loss: {total_loss.item():.4f} | LR: {lr:.6f}")
+
+                    # Validation
                     if step % config['eval_interval'] == 0 and step > 0:
-                        val_loss = validate(
-                            model, val_loader, device, curriculum, use_amp=use_amp, 
-                            validation_batch_limit=config['validation_batch_limit']
-                        )
-                        
+                        if config['mode'] == 'token':
+                            val_loss = validate(
+                                model, val_loader, device, curriculum, use_amp=use_amp,
+                                validation_batch_limit=config['validation_batch_limit']
+                            )
+                        else:
+                            # Simplified validation for chunk mode
+                            model.eval()
+                            total_val_loss = 0.0
+                            with torch.no_grad():
+                                for i, batch in enumerate(val_loader):
+                                    if i >= config['validation_batch_limit']: break
+                                    input_ids = batch['input_ids'].to(device)
+                                    labels = batch['labels'].to(device)
+                                    output = model(input_ids)
+                                    logits = output['logits']
+                                    total_val_loss += F.cross_entropy(logits.view(-1, model.vocab_size), labels.view(-1)).item()
+                            val_loss = total_val_loss / min(len(val_loader), config['validation_batch_limit'])
+                            model.train()
+
                         logger.info(f"\n📊 Validation Loss: {val_loss:.4f} (Best: {best_val_loss:.4f})")
                         
                         # Best Model Checkpointing (FIXED: Moved here and tracks best_val_loss)
