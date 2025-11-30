@@ -63,16 +63,16 @@ Hierarchical Sequence Transformer (HST) is an advanced neural architecture that 
 
 | Version | Year | Key Innovation | Performance Focus |
 |---------|------|----------------|-------------------|
-| **HST v3** | 2024 | Ultra architecture foundation | Raw speed optimization |
-| **HST v4** | 2024 | Unified processing pipeline | Consistency improvements |
-| **HST v5** | 2024 | Second-gen unification | Enhanced chunk processing |
-| **HST v6** | 2024 | Giga-scale architecture | Maximum throughput |
-| **HST v6.1-6.3** | 2024 | Adaptive bottom processing | Dynamic optimization |
-| **HST v7.1** | 2024 | Ultimate architecture | Feature completeness |
-| **HST v7.1.2** | 2024 | Agile processing | Efficiency focus |
-| **HST v7.2** | 2024 | Enhanced chunking | Memory optimization |
-| **HST v8** | 2024 | Crystalline architecture | Mathematical foundations |
-| **HST v8.1** | 2024 | Crystalline refinement | Production readiness |
+| **HST v3** | 2025 | Ultra architecture foundation | Raw speed optimization |
+| **HST v4** | 2025 | Unified processing pipeline | Consistency improvements |
+| **HST v5** | 2025 | Second-gen unification | Enhanced chunk processing |
+| **HST v6** | 2025 | Giga-scale architecture | Maximum throughput |
+| **HST v6.1-6.3** | 2025 | Adaptive bottom processing | Dynamic optimization |
+| **HST v7.1** | 2025 | Ultimate architecture | Feature completeness |
+| **HST v7.1.2** | 2025 | Agile processing | Efficiency focus |
+| **HST v7.2** | 2025 | Enhanced chunking | Memory optimization |
+| **HST v8** | 2025 | Crystalline architecture | Mathematical foundations |
+| **HST v8.1** | 2025 | Crystalline refinement | Production readiness |
 
 ---
 
