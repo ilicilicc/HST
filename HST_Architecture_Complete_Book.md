@@ -190,9 +190,9 @@ Our comprehensive benchmark testing across all HST versions reveals significant 
 | 3 | **HST v4** | 865 | 1,100 | Unified v1 | ✅ Tested |
 | 4 | **HST v3** | 892 | 1,098 | Ultra Foundation | ✅ Tested |
 | 5 | **HST v7.1** | 477 | 624 | Ultimate | ✅ Tested |
-| 6 | **HST v7.2** | TBD | 480+ | Ultimate Enhanced | 🔄 Testing |
-| 7 | **HST v8** | TBD | TBD | Crystalline | 🔄 Pending |
-| 8 | **HST v8.1** | TBD | TBD | Crystalline Refined | 🔄 Pending |
+| 6 | **HST v7.2** | 201.7 | 480+ | Ultimate Enhanced | ✅ Tested |
+| 7 | **HST v8** | 137.1 | + | Crystalline | ✅ Tested |
+| 8 | **HST v8.1** | 150.5 | + | Crystalline Refined | ✅ Tested |
 | - | **HST v6.1-v6.3** | - | - | Adaptive Bottom | ❌ Init Issues |
 | - | **HST v7.1.2** | - | - | Agile | ❌ Init Issues |
 
