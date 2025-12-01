@@ -58,7 +58,7 @@ scaler = StandardScaler(); data = scaler.fit_transform(data.reshape(-1, 1)).resh
 train_loader = DataLoader(TensorDataset(torch.FloatTensor(data[:800]).to(device)), batch_size=32, shuffle=True)
 model = HSTENAccurate().to(device); opt = torch.optim.Adam(model.parameters(), 1e-3); crit = nn.MSELoss()
 for e in range(10):
-    for X, in train_loader: opt.zero_grad(); loss = crit(model(X)[:, :-1], X[:, 1:]); loss.backward(); opt.step()
+    for X, in train_loader: opt.zero_grad(); loss = crit(model(X)[:, :-1].squeeze(-1), X[:, 1:]); loss.backward(); opt.step()
     print(f"Epoch {e+1}: Done")
 torch.save(model.state_dict(), '/content/drive/MyDrive/HST_Training/en_accurate/hst_en_accurate.pt')
 print("✓ HST EN Accurate saved")
