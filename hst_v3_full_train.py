@@ -491,15 +491,17 @@ def compute_loss(output, targets, horizon=16, gamma=0.95, pad_id=50256):
     return loss
 
 # ==================== INITIALIZE ====================
-print("\n[1/5] Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
+print("\n[1/5] Loading tokenizer (Mistral-7B - 32k vocab, efficient)...")
+tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 tokenizer.pad_token = tokenizer.eos_token
+print(f"✓ Tokenizer loaded: {len(tokenizer)} tokens")
 
-print("[2/5] Building FULL ARCHITECTURE model (768-dim, 16-layer, 8-head)...")
+print("[2/5] Building FULL ARCHITECTURE model (896-dim, 20-layer, 8-head)...")
 model = HSTv3Ultra(
-    d_model=768,       # Reduced from 1024 to fit full architecture
+    vocab_size=32000,  # Mistral vocab (saves ~18M params vs GPT-2)
+    d_model=896,       # Optimized: 896 = 8 heads × 112 dim/head
     n_heads=8,
-    n_layers=16,       # Reduced from 24 to fit full architecture
+    n_layers=20,       # Increased from 16 (saved params allow more depth!)
     max_seq_len=512,
     horizon=16
 ).to(device)
