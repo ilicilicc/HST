@@ -152,7 +152,7 @@ License may be terminated if:
 
 This license agreement is governed by the laws applicable in Serbia and the jurisdiction where the licensor is registered. All disputes shall be resolved through appropriate legal channels.
 
-**Last Updated:** 2024  
+**Last Updated:** 2025  
 **License Version:** 1.0  
 **Registry ID:** 416684
 
