@@ -144,7 +144,7 @@ License may be terminated if:
 
 - **Phone:** +381 64 940 1756
 - **Website:** https://aethyr-global.com
-- **AI Access:** https://nextjs-ai-chatbot-eight-lilac-orm53ksnn9.vercel.app
+- **AI Access:** //
 
 ---
 
