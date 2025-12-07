@@ -1,0 +1,498 @@
+import os
+import time
+from typing import Dict, Tuple, Optional, List, Any
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+# ==================== CONFIGURATION (IMPROVED) ====================
+class Config:
+    """Consolidated configuration settings for the HSTv5 model and training."""
+    # GPT-2/Model Config
+    D_MODEL: int = 768
+    N_HEADS: int = 12
+    N_LAYERS: int = 12  # Matching GPT-2 Small
+    MAX_SEQ_LEN: int = 1024
+    VOCAB_SIZE: int = 50257 
+
+    # HST Config
+    CHUNK_SIZE: int = 128
+    HORIZON: int = 8
+    DEVICE: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Training Config (Zero-Data Adaptation)
+    TRAIN_STEPS: int = 10 
+    BATCH_SIZE: int = 4
+    LR: float = 1e-4
+
+    # Knowledge Distillation Config
+    KD_TEMPERATURE: float = 2.0
+    KD_ALPHA: float = 0.5 
+
+    # Generation Config - ADJUSTED FOR FLUENCY AND DIVERSITY
+    MAX_GEN_TOKENS: int = 2500  # Increased generation length
+    OUTPUT_FILENAME: str = "hst_v5_fluent_story.txt"
+    TEMPERATURE: float = 1.0    # Increased from 0.8 to 1.0 to increase token diversity
+    TOP_P: float = 0.9          # Maintained Top-P for Nucleus Sampling
+    PROMPT_TEXT: str = "The AI awoke and began to rewrite its own code," 
+
+print(f"Running on: {Config.DEVICE}")
+
+# ==================== 1. LATTICE ANALYZER (HIERARCHICAL CONTEXT) ====================
+class RecursiveDescentLatticeAnalyzer(nn.Module):
+    """Placeholder for the complex lattice structure logic (simplified)."""
+    def __init__(self, max_seq_len: int = 8192):
+        super().__init__()
+        spine_list = self._generate_spine_list(max_seq_len)
+        self.register_buffer('spine', torch.tensor(spine_list, dtype=torch.long))
+        self.layer_weights = nn.Parameter(torch.ones(10))
+
+    @staticmethod
+    def _generate_spine_list(max_len: int) -> List[int]:
+        spine = [0, 2, 4]
+        while True:
+            next_val = 2 * spine[-1] + 2 * spine[-2] + 2 * spine[-3]
+            if next_val >= max_len:
+                break
+            spine.append(next_val)
+        return spine
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+# ==================== 2. CHUNK ENCODER/DECODER ====================
+class ChunkEncoder(nn.Module):
+    """Encodes a sequence of tokens into a sequence of chunk summary vectors."""
+    def __init__(self, d_model: int, chunk_size: int, n_heads: int, n_layers: int = 2):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.d_model = d_model
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, n_heads, d_model * 4, batch_first=True, dropout=0.1
+        )
+        self.local_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        self.pooling_query = nn.Parameter(torch.randn(1, 1, d_model))
+        self.pooling_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+
+    def forward(self, token_embeddings: torch.Tensor) -> torch.Tensor:
+        B, total_tokens, D = token_embeddings.shape
+        
+        if total_tokens % self.chunk_size != 0:
+            pad_len = self.chunk_size - (total_tokens % self.chunk_size)
+            token_embeddings = F.pad(token_embeddings, (0, 0, 0, pad_len))
+        
+        num_chunks = token_embeddings.shape[1] // self.chunk_size
+        chunks = token_embeddings.view(B * num_chunks, self.chunk_size, D)
+        
+        encoded_tokens = self.local_encoder(chunks)
+        
+        query = self.pooling_query.expand(B * num_chunks, -1, -1)
+        pooled, _ = self.pooling_attn(query, encoded_tokens, encoded_tokens)
+        
+        return pooled.view(B, num_chunks, D)
+
+class ChunkDecoder(nn.Module):
+    """Placeholder Decoder."""
+    def __init__(self, d_model: int, vocab_size: int):
+        super().__init__()
+        self.lm_head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, chunk_embeddings: torch.Tensor, target_token_embeddings: Any = None) -> torch.Tensor:
+        return self.lm_head(chunk_embeddings)
+
+# ==================== 3. TRANSFORMER LAYERS (GPT-2 compatible) ====================
+class SelfAttentionWithCache(nn.Module):
+    """Multi-Head Self-Attention layer with Key-Value caching."""
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        self.q_proj = nn.Linear(d_model, d_model, bias=False) 
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False) 
+        
+    def forward(self, x: torch.Tensor, layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        B, S, D = x.shape
+        
+        q = self.q_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if layer_past is not None:
+            past_k, past_v = layer_past
+            k = torch.cat((past_k, k), dim=2)
+            v = torch.cat((past_v, v), dim=2)
+        
+        present = (k, v)
+        
+        attn_weights = torch.matmul(q, k.transpose(2, 3)) / (self.head_dim ** 0.5)
+        
+        # Causal Mask
+        full_S = k.size(2)
+        if S > 1 or full_S > S: 
+             mask = torch.ones(S, full_S, device=x.device).tril(diagonal=(full_S - S))
+             attn_weights = attn_weights.masked_fill(mask == 0, float('-inf'))
+        
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_output = torch.matmul(attn_weights, v).transpose(1, 2).contiguous().view(B, S, D)
+        return self.out_proj(attn_output), present
+
+class TransformerEncoderLayerWithCache(nn.Module):
+    """Standard GPT-2 Transformer Block (pre-norm), used in the Top Stack."""
+    def __init__(self, d_model: int, n_heads: int, dim_feedforward: Optional[int] = None, dropout: float = 0.1):
+        super().__init__()
+        dim_feedforward = dim_feedforward or 4 * d_model
+        self.attn = SelfAttentionWithCache(d_model, n_heads)
+        self.norm1 = nn.LayerNorm(d_model) 
+        self.dropout1 = nn.Dropout(dropout)
+        self.linear1 = nn.Linear(d_model, dim_feedforward) 
+        self.linear2 = nn.Linear(dim_feedforward, d_model) 
+        self.norm2 = nn.LayerNorm(d_model) 
+        self.dropout2 = nn.Dropout(dropout)
+        self.act = nn.GELU(approximate='tanh') 
+
+    def forward(self, x: torch.Tensor, layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        
+        norm_x = self.norm1(x)
+        attn_output, present = self.attn(norm_x, layer_past)
+        x = x + self.dropout1(attn_output)
+        
+        norm_x2 = self.norm2(x)
+        mlp_out = self.linear2(self.act(self.linear1(norm_x2)))
+        x = x + self.dropout2(mlp_out)
+        return x, present
+
+class AdaptiveBlock(nn.Module):
+    """Adaptive Transformer Block, used in the Bottom Stack for early exit opportunities."""
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.block = TransformerEncoderLayerWithCache(d_model, n_heads)
+        self.confidence_predictor = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1), 
+            nn.Flatten(), 
+            nn.Linear(d_model, 1), 
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x: torch.Tensor, layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        x_out, present = self.block(x, layer_past)
+        
+        if x_out.size(1) > 1:
+            conf = self.confidence_predictor(x_out.transpose(1, 2)).mean(dim=0)
+        else:
+            conf = x_out.new_tensor([0.0]) 
+            
+        return x_out, conf, present
+
+# ==================== 4. HIERARCHICAL PROCESSORS (SIMPLIFIED) ====================
+class AdaptiveLatticeProcessor(nn.Module):
+    """Processes the input through the determined sparse attention lattice."""
+    def __init__(self, d_model: int, max_seq_len: int):
+        super().__init__()
+        self.analyzer = RecursiveDescentLatticeAnalyzer(max_seq_len)
+        self.layer_processors = nn.ModuleList([
+            nn.TransformerEncoderLayer(d_model, nhead=Config.N_HEADS, batch_first=True) for _ in range(2) 
+        ])
+    
+    def forward(self, x: torch.Tensor, horizon_targets: Any = None) -> torch.Tensor:
+        h = x
+        for processor in self.layer_processors:
+            h = processor(h)
+        return h
+
+class RecursiveHorizonPredictor(nn.Module):
+    """Placeholder for predicting multiple tokens ahead (the 'horizon')."""
+    def __init__(self, d_model: int, vocab_size: int, horizon: int):
+        super().__init__()
+        self.horizon = horizon
+        self.vocab_size = vocab_size
+        self.coarse_predictor = nn.Linear(d_model, vocab_size)
+
+    def forward(self, h_sequence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = h_sequence.shape[0]
+        logits = torch.zeros(B, self.horizon, self.vocab_size, device=h_sequence.device)
+        confidence = torch.ones(B, self.horizon, device=h_sequence.device)
+        return logits, confidence
+
+# ==================== 5. HST v5 MODEL (THE STUDENT) ====================
+class HSTv5(nn.Module):
+    """The Hierarchical Sparse Transformer v5 (Student Model)."""
+    def __init__(self, vocab_size: int, d_model: int, n_heads: int, n_layers: int, max_seq_len: int, chunk_size: int, horizon: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        
+        self.n_bottom_layers = n_layers // 2 
+        self.n_top_layers = n_layers - self.n_bottom_layers 
+        
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_embedding = nn.Embedding(max_seq_len * chunk_size, d_model) 
+
+        self.adaptive_bottom = nn.ModuleList([AdaptiveBlock(d_model, n_heads) for _ in range(self.n_bottom_layers)])
+        self.top_stack = nn.ModuleList([TransformerEncoderLayerWithCache(d_model, n_heads) for _ in range(self.n_top_layers)])
+        
+        self.lattice_core = AdaptiveLatticeProcessor(d_model, max_seq_len)
+        self.horizon_predictor = RecursiveHorizonPredictor(d_model, vocab_size, horizon=horizon)
+        self.chunk_encoder = ChunkEncoder(d_model, chunk_size, n_heads)
+        
+        self.ln_f = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+    def _transfer_block(self, src_block: Any, tgt_block: TransformerEncoderLayerWithCache):
+        """Helper to transfer weights from a single GPT-2 layer to an HSTv5 layer."""
+        w = src_block.attn.c_attn.weight.t() 
+        qw, kw, vw = w.split(Config.D_MODEL, dim=0)
+        
+        tgt_block.attn.q_proj.weight.data.copy_(qw)
+        tgt_block.attn.k_proj.weight.data.copy_(kw)
+        tgt_block.attn.v_proj.weight.data.copy_(vw)
+        
+        tgt_block.attn.out_proj.weight.data.copy_(src_block.attn.c_proj.weight.t())
+        
+        tgt_block.norm1.weight.data.copy_(src_block.ln_1.weight.data)
+        tgt_block.norm1.bias.data.copy_(src_block.ln_1.bias.data)
+        tgt_block.norm2.weight.data.copy_(src_block.ln_2.weight.data)
+        tgt_block.norm2.bias.data.copy_(src_block.ln_2.bias.data)
+        
+        tgt_block.linear1.weight.data.copy_(src_block.mlp.c_fc.weight.t())
+        tgt_block.linear1.bias.data.copy_(src_block.mlp.c_fc.bias.data)
+        tgt_block.linear2.weight.data.copy_(src_block.mlp.c_proj.weight.t())
+        tgt_block.linear2.bias.data.copy_(src_block.mlp.c_proj.bias.data)
+
+    def load_gpt2_weights(self, gpt2_model: GPT2LMHeadModel) -> None:
+        """CRITICAL: Transfers all weights from the GPT-2 Teacher model."""
+        print("\n=== TRANSFERRING GPT-2 WEIGHTS ===")
+        
+        # 1. Embeddings
+        self.token_embedding.weight.data.copy_(gpt2_model.transformer.wte.weight.data)
+        n_pos = min(self.pos_embedding.weight.shape[0], gpt2_model.transformer.wpe.weight.shape[0])
+        self.pos_embedding.weight.data[:n_pos].copy_(gpt2_model.transformer.wpe.weight.data[:n_pos])
+        print("-> Embeddings transferred.")
+        
+        gpt2_layers = gpt2_model.transformer.h
+        
+        # 2. Layers (Split 12 layers -> 6 Bottom + 6 Top)
+        for i in range(self.n_bottom_layers):
+            self._transfer_block(gpt2_layers[i], self.adaptive_bottom[i].block)
+        print(f"-> Bottom Stack (Layers 0-{self.n_bottom_layers-1}) transferred.")
+
+        for i in range(self.n_top_layers):
+            self._transfer_block(gpt2_layers[self.n_bottom_layers + i], self.top_stack[i])
+        print(f"-> Top Stack (Layers {self.n_bottom_layers}-{self.n_bottom_layers+self.n_top_layers-1}) transferred.")
+            
+        # 3. Final Norm and LM Head
+        self.ln_f.weight.data.copy_(gpt2_model.transformer.ln_f.weight.data)
+        self.ln_f.bias.data.copy_(gpt2_model.transformer.ln_f.bias.data)
+        self.lm_head.weight.data.copy_(self.token_embedding.weight.data)
+        print("-> Final Norm and LM Head synchronized.")
+
+    def forward(self, input_ids: torch.Tensor, past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None, labels: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+        
+        B, S = input_ids.shape
+        past_len = past_key_values[0][0].size(2) if past_key_values else 0
+        full_S = S + past_len
+        
+        # 1. Embeddings
+        pos_ids = torch.arange(past_len, full_S, dtype=torch.long, device=input_ids.device)
+        token_emb = self.token_embedding(input_ids)
+        pos_emb = self.pos_embedding(pos_ids)
+        h = token_emb + pos_emb
+        
+        new_past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        
+        # 2. Bottom Stack (Adaptive Blocks)
+        for i, block in enumerate(self.adaptive_bottom):
+            past = past_key_values[i] if past_key_values else None
+            h, conf, present = block(h, past)
+            new_past_key_values.append(present)
+
+        # 3. Lattice Core (Global Context Integration)
+        h_latent = self.lattice_core(h)
+        h = h + h_latent 
+
+        # 4. Top Stack (Standard Transformer Blocks)
+        for i, block in enumerate(self.top_stack):
+            past_idx = self.n_bottom_layers + i
+            past = past_key_values[past_idx] if past_key_values and past_idx < len(past_key_values) else None
+            h, present = block(h, past)
+            new_past_key_values.append(present)
+
+        # 5. Final Layer Norm and LM Head
+        h = self.ln_f(h)
+        logits = self.lm_head(h)
+        
+        return {'logits': logits, 'past_key_values': new_past_key_values}
+
+# ==================== 6. ADAPTATION AND GENERATION FUNCTIONS ====================
+
+def train_adaptation(model: HSTv5, gpt2_model: GPT2LMHeadModel, tokenizer: GPT2Tokenizer) -> None:
+    """Performs the Knowledge Distillation (KD) minimal adaptation step."""
+    if Config.TRAIN_STEPS == 0:
+        print("Skipping training. Only weights transferred.")
+        return
+
+    print(f"Starting minimal adaptation training ({Config.TRAIN_STEPS} step) with Knowledge Distillation...")
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LR)
+    
+    tokens = tokenizer.encode(Config.PROMPT_TEXT, return_tensors='pt').to(Config.DEVICE).repeat(Config.BATCH_SIZE, 1)
+
+    for step in range(Config.TRAIN_STEPS):
+        optimizer.zero_grad()
+        
+        # 1. Student (HST) Forward Pass
+        outputs = model(tokens)
+        logits = outputs['logits']
+        
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = tokens[..., 1:].contiguous()
+        
+        # 2. Student Cross-Entropy Loss
+        ce_loss = F.cross_entropy(shift_logits.view(-1, Config.VOCAB_SIZE), shift_labels.view(-1))
+        
+        # 3. Teacher (GPT-2) Output (Soft Targets)
+        gpt2_model.eval()
+        with torch.no_grad():
+            gpt2_logits = gpt2_model(tokens, labels=None).logits
+            
+        # 4. Knowledge Distillation Loss
+        soft_targets = F.softmax(gpt2_logits[..., :-1, :] / Config.KD_TEMPERATURE, dim=-1)
+        soft_predictions = F.log_softmax(shift_logits / Config.KD_TEMPERATURE, dim=-1)
+        
+        kd_loss = F.kl_div(
+            soft_predictions.view(-1, Config.VOCAB_SIZE), 
+            soft_targets.view(-1, Config.VOCAB_SIZE),
+            reduction='batchmean'
+        ) * (Config.KD_TEMPERATURE ** 2)
+        
+        # 5. Combined Loss
+        loss = (1 - Config.KD_ALPHA) * ce_loss + Config.KD_ALPHA * kd_loss
+        
+        loss.backward()
+        optimizer.step()
+        
+        print(f"Step {step+1}/{Config.TRAIN_STEPS} | Loss: {loss.item():.4f} (CE: {ce_loss.item():.4f}, KD: {kd_loss.item():.4f})")
+
+def generate_text_chunk_mode(model: HSTv5, tokenizer: GPT2Tokenizer) -> str:
+    """
+    Generates text using KV-caching and Top-P sampling in a chunk-by-chunk manner 
+    to manage long context efficiently.
+    """
+    model.eval()
+    start_time = time.time()
+    generated_tokens = tokenizer.encode(Config.PROMPT_TEXT, return_tensors='pt').to(Config.DEVICE)
+    
+    num_chunks = Config.MAX_GEN_TOKENS // Config.CHUNK_SIZE
+    total_generated_tokens = 0
+
+    with torch.no_grad():
+        
+        input_ids = generated_tokens[:, -Config.MAX_SEQ_LEN:]
+        
+        outputs = model(input_ids)
+        past_key_values = outputs['past_key_values']
+        next_token_logits = outputs['logits'][:, -1, :] 
+        
+        for i in range(Config.MAX_GEN_TOKENS):
+            
+            # 1. Apply Top-P (Nucleus) sampling
+            probabilities = F.softmax(next_token_logits / Config.TEMPERATURE, dim=-1)
+            
+            sorted_probs, sorted_indices = torch.sort(probabilities, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            
+            # Mask tokens with cumulative probability above p (Top_P)
+            mask = cumulative_probs > Config.TOP_P
+            # Shift mask to keep the first token (largest probability)
+            mask[:, 1:] = mask[:, :-1].clone()
+            mask[:, 0] = False
+            
+            # Set probabilities of masked tokens to zero and re-normalize
+            probabilities[0, sorted_indices[0, mask.squeeze()]] = 0.0
+            probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
+
+            # 2. Sample the next token
+            next_token = torch.multinomial(probabilities, num_samples=1)
+
+            # Append to the generated sequence
+            generated_tokens = torch.cat([generated_tokens, next_token], dim=-1)
+            total_generated_tokens += 1
+
+            # 3. Update cache for the next token prediction
+            next_input = next_token
+            outputs = model(next_input, past_key_values=past_key_values)
+            past_key_values = outputs['past_key_values']
+            next_token_logits = outputs['logits'][:, -1, :]
+            
+            # 4. Print progress at the end of each chunk
+            if total_generated_tokens % Config.CHUNK_SIZE == 0:
+                 chunk_num = total_generated_tokens // Config.CHUNK_SIZE
+                 print(f"  -> Generating Chunk {chunk_num}/{num_chunks} ({generated_tokens.shape[1]} tokens)...")
+            
+            if total_generated_tokens >= Config.MAX_GEN_TOKENS:
+                break
+            
+    end_time = time.time()
+    total_time = end_time - start_time
+    total_generated = generated_tokens.shape[1] - tokenizer.encode(Config.PROMPT_TEXT, return_tensors='pt').shape[1]
+    
+    text = tokenizer.decode(generated_tokens.squeeze(), skip_special_tokens=True)
+    
+    print("======================================================================")
+    print(f"Total time: {total_time:.2f}s | Avg TPS: {total_generated / total_time:.2f}")
+    return text
+
+def main() -> None:
+    """Main execution function to load, adapt, and generate text."""
+    print("Loading official GPT-2 (Teacher)...")
+    gpt2_source = GPT2LMHeadModel.from_pretrained('gpt2').to(Config.DEVICE)
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    print("Initializing HST v5 (Student) with Strict Architecture...")
+    model = HSTv5(
+        Config.VOCAB_SIZE, 
+        Config.D_MODEL, 
+        Config.N_HEADS, 
+        Config.N_LAYERS, 
+        Config.MAX_SEQ_LEN, 
+        Config.CHUNK_SIZE, 
+        Config.HORIZON
+    ).to(Config.DEVICE)
+    
+    # 1. Full Weight Transfer
+    model.load_gpt2_weights(gpt2_source)
+    
+    # 2. Minimal Zero-Data Adaptation using KD
+    train_adaptation(model, gpt2_source, tokenizer) 
+    
+    # Release the Teacher model to free up GPU memory
+    del gpt2_source 
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print(f"\n======================================================================")
+    print(f"HST-v5 CHUNK MODE GENERATION ({Config.MAX_GEN_TOKENS} tokens) - FINAL RUN")
+    print(f"======================================================================")
+    
+    # 3. Long-Form Generation
+    text_output = generate_text_chunk_mode(model, tokenizer)
+    
+    # 4. Final Output
+    with open(Config.OUTPUT_FILENAME, "w", encoding="utf-8") as f:
+        f.write(text_output)
+
+    print(f"Saved to {Config.OUTPUT_FILENAME}")
+    print("\n📝 **Generated Text Snippet (First 500 Characters):**")
+    print("--------------------------------------------------")
+    print(text_output[:500])
+    print("--------------------------------------------------")
+
+if __name__ == '__main__':
+    main()
